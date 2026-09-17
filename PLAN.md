@@ -173,6 +173,20 @@ The Cursor agent process exited with code 1
 - 对外返回安全、明确的错误码。
 - 日志中记录完整诊断信息，但不得记录认证令牌和完整敏感提示词。
 
+### 3.10 Cursor 权限请求无法显示为 Codex 提权确认
+
+已观察到某些需要提权的操作不会在 Codex 中弹出确认，随后 Cursor 只报告“没有获取权限”。根因是 Cursor ACP 的 `session/request_permission` 和 Codex 客户端的审批/沙箱权限不是同一套协议，不能把 ACP 的 `allow-once` 简单当作 Codex 已授权。
+
+处理原则：
+
+- 未识别的 Cursor 原生文件、终端或系统权限默认拒绝，绝不静默批准。
+- Codex 提供的工具通过 Bridge 自己的 MCP 工具服务暴露给 Cursor。
+- Cursor 请求 Bridge 工具时，只允许生成标准 Responses tool call；真正执行仍交给 Codex，因此权限确认由 Codex 正常显示。
+- 只有明确识别为 Bridge 自有、且尚未执行外部副作用的 MCP 调用，才可以在 ACP 层自动选择 `allow-once`。
+- Cursor 自带 shell、文件编辑、浏览器或其他未知工具不能绕过 Codex 权限系统。
+- 无法转交给 Codex 的提权请求返回明确的 `permission_required`/`unsupported_permission_bridge` 错误，包含工具名称和请求类型，不再只显示“没有权限”。
+- Windows UAC 属于操作系统级确认，不能伪装成普通 ACP 权限；需要由 Codex 实际执行命令时走其现有提权流程。
+
 ## 4. 新项目范围
 
 ### 必须实现
@@ -370,6 +384,9 @@ docs/
 - [ ] 设计连接池容量、排队和超时默认值。
 - [ ] 确认新电脑迁移时 Cursor Agent 的安装方式和路径变化。
 - [ ] 决定是否需要自动检测 Codex 正在运行并拒绝切换配置。
+- [ ] 捕获真实 `session/request_permission` 样本，区分 Bridge MCP、Cursor 原生 shell、文件编辑和其他工具。
+- [ ] 验证 Codex Desktop 对 Responses tool call 的审批展示和提权行为。
+- [ ] 为未知权限、用户拒绝和操作系统提权分别设计明确错误码。
 
 ## 11.1 阶段 A 首次实测结果
 

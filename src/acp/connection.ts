@@ -32,6 +32,9 @@ export type AcpConnectionOptions = {
   requestTimeoutMs?: number;
   skipAuthenticate?: boolean;
   onDiagnostic?: (message: string) => void;
+  onPermission?: (
+    request: Record<string, unknown>,
+  ) => string | undefined | Promise<string | undefined>;
 };
 
 function textFromContent(content: unknown): string {
@@ -274,13 +277,25 @@ export class AcpConnection {
       const options = Array.isArray(message.params?.options)
         ? (message.params.options as Array<{ optionId?: string; kind?: string }>)
         : [];
-      const selected =
-        options.find((item) => item.kind === "allow_once")?.optionId ??
-        options.find((item) => item.optionId === "allow-once")?.optionId ??
-        "allow-once";
-      this.#respond(message.id, {
-        outcome: { outcome: "selected", optionId: selected },
-      });
+      void Promise.resolve(this.#options.onPermission?.(message.params ?? {}))
+        .then((requested) => {
+          const selected =
+            requested ??
+            options.find((item) => item.kind === "reject_once")?.optionId ??
+            options.find((item) => item.optionId === "reject-once")?.optionId ??
+            "reject-once";
+          this.#respond(message.id!, {
+            outcome: { outcome: "selected", optionId: selected },
+          });
+        })
+        .catch((error) => {
+          this.#options.onDiagnostic?.(
+            `Permission handler failed: ${errorMessage(error)}`,
+          );
+          this.#respond(message.id!, {
+            outcome: { outcome: "selected", optionId: "reject-once" },
+          });
+        });
       return;
     }
 

@@ -1,6 +1,7 @@
 import readline from "node:readline";
 
 let sessionCounter = 0;
+let pendingPermissionPrompt;
 const input = readline.createInterface({ input: process.stdin });
 
 function send(value) {
@@ -9,6 +10,17 @@ function send(value) {
 
 input.on("line", (line) => {
   const message = JSON.parse(line);
+  if (message.id === 900 && message.method === undefined) {
+    if (pendingPermissionPrompt) {
+      send({
+        jsonrpc: "2.0",
+        id: pendingPermissionPrompt.id,
+        result: { stopReason: "end_turn" },
+      });
+      pendingPermissionPrompt = undefined;
+    }
+    return;
+  }
   if (message.method === "initialize") {
     send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: 1 } });
     return;
@@ -32,6 +44,7 @@ input.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     const sessionId = message.params.sessionId;
+    const promptText = message.params.prompt?.[0]?.text ?? "";
     send({
       jsonrpc: "2.0",
       method: "session/update",
@@ -43,10 +56,27 @@ input.on("line", (line) => {
         },
       },
     });
+    if (promptText === "permission") {
+      pendingPermissionPrompt = message;
+      send({
+        jsonrpc: "2.0",
+        id: 900,
+        method: "session/request_permission",
+        params: {
+          sessionId,
+          toolCall: { title: "shell" },
+          options: [
+            { optionId: "allow-once", kind: "allow_once" },
+            { optionId: "reject-once", kind: "reject_once" },
+          ],
+        },
+      });
+      return;
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,
       result: { stopReason: "end_turn" },
-    });
-  }
+  });
+}
 });

@@ -52,4 +52,26 @@ describe("AcpConnection", () => {
     expect(first.text).toBe("reply:session-1");
     expect(second.text).toBe("reply:session-2");
   });
+
+  it("delegates permission choice instead of silently allowing it", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const connection = new AcpConnection({
+      command: process.execPath,
+      args: [fixture],
+      cwd: process.cwd(),
+      skipAuthenticate: true,
+      requestTimeoutMs: 5_000,
+      onPermission: (request) => {
+        seen.push(request);
+        return "allow-once";
+      },
+    });
+    connections.push(connection);
+
+    const result = await connection.runSession({ prompt: "permission" });
+
+    expect(result.stopReason).toBe("end_turn");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.toolCall).toEqual({ title: "shell" });
+  });
 });
