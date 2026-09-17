@@ -36,6 +36,9 @@ export type AcpConnectionOptions = {
   onPermission?: (
     request: Record<string, unknown>,
   ) => string | undefined | Promise<string | undefined>;
+  onText?: (text: string) => void;
+  onReasoning?: (text: string) => void;
+  onSessionUpdate?: (update: SessionUpdate) => void;
 };
 
 function textFromContent(content: unknown): string {
@@ -205,6 +208,31 @@ export class AcpConnection {
     this.#child?.kill();
   }
 
+  async createSession(
+    cwd: string,
+    mcpServers: unknown[] = [],
+  ): Promise<AcpSessionResult> {
+    await this.start();
+    return (await this.#request("session/new", { cwd, mcpServers })) as AcpSessionResult;
+  }
+
+  async setSessionOption(sessionId: string, configId: string, value: string): Promise<void> {
+    await this.#request("session/set_config_option", { sessionId, configId, value });
+  }
+
+  promptSession(sessionId: string, prompt: string): Promise<AcpPromptResult> {
+    return this.#request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: prompt }],
+    }) as Promise<AcpPromptResult>;
+  }
+
+  cancelSession(sessionId: string): void {
+    this.#child?.stdin?.write(
+      `${JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } })}\n`,
+    );
+  }
+
   #request(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (this.#closed) return Promise.reject(new Error("ACP connection is closed"));
     const stdin = this.#child?.stdin;
@@ -259,6 +287,13 @@ export class AcpConnection {
           : typeof update.sessionId === "string"
             ? update.sessionId
             : undefined;
+      this.#options.onSessionUpdate?.(update);
+      const text = textFromContent(update.content);
+      if (update.sessionUpdate === "agent_message_chunk" && text) {
+        this.#options.onText?.(text);
+      } else if (update.sessionUpdate === "agent_thought_chunk" && text) {
+        this.#options.onReasoning?.(text);
+      }
       if (!this.#active) return;
       if (sessionId && sessionId !== this.#active.id) {
         this.#options.onDiagnostic?.(
@@ -266,7 +301,6 @@ export class AcpConnection {
         );
         return;
       }
-      const text = textFromContent(update.content);
       if (!text) return;
       if (update.sessionUpdate === "agent_message_chunk") {
         this.#active.text += text;

@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { findCursorAgent } from "./cursor/discovery.js";
 import { listCursorModels } from "./cursor/models.js";
 import { createBridgeServer } from "./http/server.js";
+import { ToolSession } from "./tools/session.js";
 
 const config = loadConfig();
 const agent = await findCursorAgent();
@@ -19,7 +20,23 @@ const pool = new AcpPool({
       skipAuthenticate: true,
     }),
 });
-const server = createBridgeServer({ config, pool, models });
+const server = createBridgeServer({
+  config,
+  pool,
+  models,
+  createToolSession: (tools) =>
+    new ToolSession(
+      {
+        command: agent.command,
+        args: [...agent.prefixArgs, "--workspace", config.workspace, "acp"],
+        cwd: config.workspace,
+        env: agent.env,
+        skipAuthenticate: true,
+        requestTimeoutMs: 5 * 60_000,
+      },
+      tools,
+    ),
+});
 
 server.listen(config.port, config.host, () => {
   console.log(`codex-cursor-bridge listening on http://${config.host}:${config.port}`);

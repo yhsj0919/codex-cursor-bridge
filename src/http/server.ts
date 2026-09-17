@@ -4,6 +4,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AcpPool } from "../acp/pool.js";
 import type { BridgeConfig } from "../config.js";
 import type { CursorModel } from "../cursor/models.js";
+import type { ToolSession, ToolTurn } from "../tools/session.js";
+import type { ToolDefinition, ToolOutput } from "../tools/types.js";
 import {
   buildModelCatalog,
   resolveCatalogModel,
@@ -15,6 +17,7 @@ type ResponsesBody = {
   input?: unknown;
   stream?: boolean;
   reasoning?: { effort?: string };
+  tools?: unknown[];
 };
 
 function json(res: ServerResponse, status: number, value: unknown): void {
@@ -100,9 +103,43 @@ export function createBridgeServer(options: {
   config: BridgeConfig;
   pool: AcpPool;
   models: CursorModel[];
+  createToolSession?: (tools: ToolDefinition[]) => ToolSession;
 }) {
   const { config, pool, models } = options;
   const catalog = buildModelCatalog(models);
+  const toolSessions = new Map<string, ToolSession>();
+
+  const parseTools = (raw: unknown[] | undefined): ToolDefinition[] => (raw ?? []).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const tool = item as Record<string, unknown>;
+    if ((tool.type !== "function" && tool.type !== "custom") || typeof tool.name !== "string") return [];
+    return [{
+      name: tool.name,
+      ...(typeof tool.description === "string" ? { description: tool.description } : {}),
+      inputSchema: tool.type === "function" && tool.parameters && typeof tool.parameters === "object"
+        ? tool.parameters as Record<string, unknown>
+        : { type: "object", properties: { input: { type: "string" } } },
+      responseType: tool.type,
+    } satisfies ToolDefinition];
+  });
+
+  const parseOutputs = (input: unknown): ToolOutput[] => !Array.isArray(input) ? [] : input.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const value = item as Record<string, unknown>;
+    if ((value.type !== "function_call_output" && value.type !== "custom_tool_call_output") || typeof value.call_id !== "string") return [];
+    return [{ callId: value.call_id, output: typeof value.output === "string" ? value.output : JSON.stringify(value.output ?? "") }];
+  });
+
+  const toolResponse = (id: string, model: string, turn: ToolTurn) => ({
+    id, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed", error: null, model,
+    output: [
+      ...(turn.text ? [{ id: `msg_${randomUUID().replaceAll("-", "")}`, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: turn.text, annotations: [] }] }] : []),
+      ...turn.calls.map((call) => call.responseType === "custom"
+        ? { id: call.itemId, type: "custom_tool_call", status: "completed", call_id: call.callId, name: call.name, input: call.arguments }
+        : { id: call.itemId, type: "function_call", status: "completed", call_id: call.callId, name: call.name, arguments: call.arguments }),
+    ],
+    output_text: turn.text, tools: [], tool_choice: "auto", parallel_tool_calls: true,
+  });
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -150,6 +187,43 @@ export function createBridgeServer(options: {
       }
       const model = resolved.catalogId;
       const id = `resp_${randomUUID().replaceAll("-", "")}`;
+      const submittedOutputs = parseOutputs(body.input);
+      const definitions = parseTools(body.tools);
+
+      if (submittedOutputs.length > 0 || definitions.length > 0) {
+        if (!options.createToolSession) throw new Error("Tool bridge is not configured");
+        let session: ToolSession;
+        let turn: ToolTurn;
+        if (submittedOutputs.length > 0) {
+          session = toolSessions.get(submittedOutputs[0]!.callId)!;
+          if (!session || !submittedOutputs.every((output) => session.has(output.callId))) {
+            json(res, 409, { error: { message: "Tool session is missing or expired", code: "tool_session_expired" } });
+            return;
+          }
+          for (const output of submittedOutputs) toolSessions.delete(output.callId);
+          turn = await session.resume(submittedOutputs);
+        } else {
+          session = options.createToolSession(definitions);
+          await session.start(prompt, config.workspace, resolved.cursorId);
+          turn = await session.collect();
+        }
+        if (turn.status === "tool_calls") {
+          for (const call of turn.calls) toolSessions.set(call.callId, session);
+        }
+        const response = toolResponse(id, model, turn);
+        if (body.stream) {
+          res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" });
+          sse(res, "response.created", { type: "response.created", response: { id, object: "response", status: "in_progress", model, output: [] } });
+          for (let index = 0; index < response.output.length; index += 1) {
+            const item = response.output[index];
+            sse(res, "response.output_item.added", { type: "response.output_item.added", response_id: id, output_index: index, item });
+            sse(res, "response.output_item.done", { type: "response.output_item.done", response_id: id, output_index: index, item });
+          }
+          sse(res, "response.completed", { type: "response.completed", response });
+          res.end("data: [DONE]\n\n");
+        } else json(res, 200, response);
+        return;
+      }
 
       if (body.stream) {
         res.writeHead(200, {
