@@ -406,6 +406,18 @@ docs/
 - 当前原型在单连接内串行执行，因此不会发生通知串线。
 - 下一步需要实现小型连接池，在保持“每连接单活动 session”的前提下支持并发。
 
+阶段 B 首次 HTTP 实测：
+
+```text
+GET /healthz：200
+GET /v1/models：返回 223 个 Cursor 原始模型
+POST /v1/responses 请求 1：约 11.4 秒，返回 OK
+POST /v1/responses 请求 2：约 7.4 秒，返回 OK
+连接池状态：size=1, busy=0, idle=1, waiting=0
+```
+
+已完成最小连接池：默认最多两个常驻 ACP 连接；每个连接只允许一个活动 session；空闲连接复用；满池请求排队；失效连接淘汰。
+
 ## 12. 已验证的参考实现行为
 
 旧项目 `E:\cursor-api-proxy` 可作为行为参考，但不直接复制架构。

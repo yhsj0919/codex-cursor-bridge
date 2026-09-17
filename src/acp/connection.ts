@@ -22,6 +22,7 @@ type ActiveSession = {
   reasoning: string;
   startedAt: number;
   firstTextAt?: number;
+  onText?: (text: string) => void;
 };
 
 export type AcpConnectionOptions = {
@@ -99,6 +100,7 @@ export class AcpConnection {
     this.#reader.on("line", (line) => this.#handleLine(line));
     child.once("error", (error) => this.#fail(error));
     child.once("close", (code) => {
+      this.#closed = true;
       this.#fail(
         new Error(
           `Cursor ACP exited with code ${code ?? 1}${
@@ -127,6 +129,7 @@ export class AcpConnection {
     cwd?: string;
     model?: string;
     mode?: "agent" | "plan" | "ask";
+    onText?: (text: string) => void;
   }): Promise<SessionRunResult> {
     const queuedAt = Date.now();
     const task = this.#queue.then(async () => {
@@ -160,6 +163,7 @@ export class AcpConnection {
         text: "",
         reasoning: "",
         startedAt,
+        ...(options.onText ? { onText: options.onText } : {}),
       };
       const result = (await this.#request("session/prompt", {
         sessionId: session.sessionId,
@@ -267,6 +271,7 @@ export class AcpConnection {
       if (update.sessionUpdate === "agent_message_chunk") {
         this.#active.text += text;
         this.#active.firstTextAt ??= Date.now();
+        this.#active.onText?.(text);
       } else if (update.sessionUpdate === "agent_thought_chunk") {
         this.#active.reasoning += text;
       }
