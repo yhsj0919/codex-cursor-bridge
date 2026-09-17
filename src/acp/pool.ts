@@ -6,6 +6,7 @@ export type SessionRequest = {
   model?: string;
   mode?: "agent" | "plan" | "ask";
   onText?: (text: string) => void;
+  signal?: AbortSignal;
 };
 
 export type AcpSessionRunner = {

@@ -98,4 +98,27 @@ describe("AcpPool", () => {
     expect(connection.calls).toEqual(["one", "two"]);
     await pool.close();
   });
+
+  it("replaces a connection that dies during a request", async () => {
+    const created: FakeConnection[] = [];
+    const pool = new AcpPool({
+      maxConnections: 1,
+      createConnection: () => {
+        const connection = new FakeConnection();
+        if (created.length === 0) {
+          connection.runSession = async () => {
+            connection.running = false;
+            throw new Error("ACP crashed");
+          };
+        }
+        created.push(connection);
+        return connection;
+      },
+    });
+
+    await expect(pool.runSession({ prompt: "first" })).rejects.toThrow("ACP crashed");
+    await expect(pool.runSession({ prompt: "second" })).resolves.toMatchObject({ text: "second" });
+    expect(created).toHaveLength(2);
+    await pool.close();
+  });
 });

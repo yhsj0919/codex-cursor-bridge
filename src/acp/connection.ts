@@ -133,6 +133,7 @@ export class AcpConnection {
     model?: string;
     mode?: "agent" | "plan" | "ask";
     onText?: (text: string) => void;
+    signal?: AbortSignal;
   }): Promise<SessionRunResult> {
     const queuedAt = Date.now();
     const task = this.#queue.then(async () => {
@@ -145,6 +146,9 @@ export class AcpConnection {
       })) as AcpSessionResult;
       const sessionNewMs = Date.now() - sessionStart;
       if (!session.sessionId) throw new Error("ACP session/new returned no sessionId");
+      const cancel = () => this.cancelSession(session.sessionId);
+      if (options.signal?.aborted) cancel();
+      else options.signal?.addEventListener("abort", cancel, { once: true });
 
       if (options.model && options.model.toLowerCase() !== "auto") {
         await this.#request("session/set_config_option", {
@@ -168,15 +172,24 @@ export class AcpConnection {
         startedAt,
         ...(options.onText ? { onText: options.onText } : {}),
       };
-      const result = (await this.#request("session/prompt", {
-        sessionId: session.sessionId,
-        prompt: [{ type: "text", text: options.prompt }],
-      })) as AcpPromptResult;
+      let result: AcpPromptResult;
+      try {
+        result = (await this.#request("session/prompt", {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: options.prompt }],
+        })) as AcpPromptResult;
+      } catch (error) {
+        this.#active = undefined;
+        throw error;
+      } finally {
+        options.signal?.removeEventListener("abort", cancel);
+      }
       const active = this.#active;
       this.#active = undefined;
       if (!active || active.id !== session.sessionId) {
         throw new Error("ACP active session routing state was lost");
       }
+      if (options.signal?.aborted) throw new Error("Client disconnected; ACP session cancelled");
       return {
         sessionId: session.sessionId,
         text: active.text,

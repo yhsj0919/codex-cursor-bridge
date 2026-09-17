@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { isAbsolute, relative, resolve } from "node:path";
 
 import type { AcpPool } from "../acp/pool.js";
 import type { BridgeConfig } from "../config.js";
@@ -19,6 +21,15 @@ type ResponsesBody = {
   reasoning?: { effort?: string };
   tools?: unknown[];
 };
+
+type SessionRunner = {
+  readonly stats: unknown;
+  runSession(request: { prompt: string; cwd?: string; model?: string; mode?: "agent" | "plan" | "ask"; onText?: (text: string) => void; signal?: AbortSignal }): Promise<{ text: string }>;
+};
+
+type ToolSessionLike = Pick<ToolSession, "start" | "collect" | "resume" | "has" | "close">;
+
+type StoredToolSession = { session: ToolSessionLike; owner: string; expiresAt: number };
 
 function json(res: ServerResponse, status: number, value: unknown): void {
   const body = JSON.stringify(value);
@@ -99,15 +110,50 @@ function sse(res: ServerResponse, event: string, data: unknown): void {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+function requestOwner(req: IncomingMessage): string {
+  return `${req.socket.remoteAddress ?? "local"}|${req.headers.authorization ?? ""}|${req.headers["x-codex-session-id"] ?? ""}`;
+}
+
+function requestWorkspace(req: IncomingMessage, root: string): string {
+  const header = req.headers["x-cursor-workspace"];
+  if (!header) return realpathSync(root);
+  const raw = Array.isArray(header) ? header[0] : header;
+  if (!raw) return realpathSync(root);
+  const candidate = realpathSync(resolve(raw));
+  const base = realpathSync(root);
+  const child = relative(base, candidate);
+  if (!existsSync(candidate) || !statSync(candidate).isDirectory() || child.startsWith("..") || isAbsolute(child)) {
+    throw new Error(`Workspace must be an existing directory under ${base}`);
+  }
+  return candidate;
+}
+
 export function createBridgeServer(options: {
   config: BridgeConfig;
-  pool: AcpPool;
+  pool: AcpPool | SessionRunner;
   models: CursorModel[];
-  createToolSession?: (tools: ToolDefinition[]) => ToolSession;
+  createToolSession?: (tools: ToolDefinition[]) => ToolSessionLike;
+  toolSessionTtlMs?: number;
+  maxToolSessions?: number;
 }) {
   const { config, pool, models } = options;
   const catalog = buildModelCatalog(models);
-  const toolSessions = new Map<string, ToolSession>();
+  const toolSessions = new Map<string, StoredToolSession>();
+  const toolSessionTtlMs = options.toolSessionTtlMs ?? 10 * 60_000;
+  const maxToolSessions = options.maxToolSessions ?? 128;
+  const cleanup = (): void => {
+    const now = Date.now();
+    const expired = new Set<ToolSessionLike>();
+    for (const [callId, stored] of toolSessions) {
+      if (stored.expiresAt <= now) {
+        toolSessions.delete(callId);
+        expired.add(stored.session);
+      }
+    }
+    for (const session of expired) void session.close();
+  };
+  const cleanupTimer = setInterval(cleanup, Math.min(toolSessionTtlMs, 60_000));
+  cleanupTimer.unref();
 
   const parseTools = (raw: unknown[] | undefined): ToolDefinition[] => (raw ?? []).flatMap((item) => {
     if (!item || typeof item !== "object") return [];
@@ -165,8 +211,13 @@ export function createBridgeServer(options: {
       }
 
       const body = await readJson(req);
+      const abort = new AbortController();
+      res.once("close", () => {
+        if (!res.writableEnded) abort.abort();
+      });
       const prompt = inputText(body.input);
-      if (!prompt) {
+      const submittedOutputs = parseOutputs(body.input);
+      if (!prompt && submittedOutputs.length === 0) {
         json(res, 400, {
           error: { message: "input must contain text", code: "invalid_input" },
         });
@@ -187,36 +238,59 @@ export function createBridgeServer(options: {
       }
       const model = resolved.catalogId;
       const id = `resp_${randomUUID().replaceAll("-", "")}`;
-      const submittedOutputs = parseOutputs(body.input);
       const definitions = parseTools(body.tools);
+      let workspace: string;
+      try {
+        workspace = requestWorkspace(req, config.workspace);
+      } catch (error) {
+        json(res, 400, { error: { message: error instanceof Error ? error.message : String(error), code: "invalid_workspace" } });
+        return;
+      }
 
       if (submittedOutputs.length > 0 || definitions.length > 0) {
         if (!options.createToolSession) throw new Error("Tool bridge is not configured");
-        let session: ToolSession;
+        let session: ToolSessionLike;
         let turn: ToolTurn;
         if (submittedOutputs.length > 0) {
-          session = toolSessions.get(submittedOutputs[0]!.callId)!;
-          if (!session || !submittedOutputs.every((output) => session.has(output.callId))) {
+          cleanup();
+          const stored = toolSessions.get(submittedOutputs[0]!.callId);
+          const owner = requestOwner(req);
+          session = stored?.session!;
+          if (!stored || stored.owner !== owner || !submittedOutputs.every((output) => session.has(output.callId))) {
             json(res, 409, { error: { message: "Tool session is missing or expired", code: "tool_session_expired" } });
             return;
           }
           for (const output of submittedOutputs) toolSessions.delete(output.callId);
           turn = await session.resume(submittedOutputs);
         } else {
+          cleanup();
+          if (new Set([...toolSessions.values()].map((entry) => entry.session)).size >= maxToolSessions) {
+            json(res, 503, { error: { message: "Too many pending tool sessions", code: "tool_session_limit" } });
+            return;
+          }
           session = options.createToolSession(definitions);
-          await session.start(prompt, config.workspace, resolved.cursorId);
+          await session.start(prompt, workspace, resolved.cursorId);
           turn = await session.collect();
         }
         if (turn.status === "tool_calls") {
-          for (const call of turn.calls) toolSessions.set(call.callId, session);
+          const stored = { session, owner: requestOwner(req), expiresAt: Date.now() + toolSessionTtlMs };
+          for (const call of turn.calls) toolSessions.set(call.callId, stored);
         }
         const response = toolResponse(id, model, turn);
         if (body.stream) {
           res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" });
           sse(res, "response.created", { type: "response.created", response: { id, object: "response", status: "in_progress", model, output: [] } });
           for (let index = 0; index < response.output.length; index += 1) {
-            const item = response.output[index];
+            const item = response.output[index]!;
+            const eventItem = item as Record<string, unknown>;
             sse(res, "response.output_item.added", { type: "response.output_item.added", response_id: id, output_index: index, item });
+            if (item.type === "function_call") {
+              sse(res, "response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", response_id: id, item_id: item.id, output_index: index, delta: eventItem.arguments });
+              sse(res, "response.function_call_arguments.done", { type: "response.function_call_arguments.done", response_id: id, item_id: item.id, output_index: index, arguments: eventItem.arguments });
+            } else if (item.type === "custom_tool_call") {
+              sse(res, "response.custom_tool_call_input.delta", { type: "response.custom_tool_call_input.delta", response_id: id, item_id: item.id, output_index: index, delta: eventItem.input });
+              sse(res, "response.custom_tool_call_input.done", { type: "response.custom_tool_call_input.done", response_id: id, item_id: item.id, output_index: index, input: eventItem.input });
+            }
             sse(res, "response.output_item.done", { type: "response.output_item.done", response_id: id, output_index: index, item });
           }
           sse(res, "response.completed", { type: "response.completed", response });
@@ -261,6 +335,7 @@ export function createBridgeServer(options: {
         });
         const result = await pool.runSession({
           prompt,
+          cwd: workspace,
           model: resolved.cursorId,
           mode: "agent",
           onText: (text) =>
@@ -269,6 +344,7 @@ export function createBridgeServer(options: {
               ...baseEvent,
               delta: text,
             }),
+          signal: abort.signal,
         });
         sse(res, "response.output_text.done", {
           type: "response.output_text.done",
@@ -302,8 +378,10 @@ export function createBridgeServer(options: {
 
       const result = await pool.runSession({
         prompt,
+        cwd: workspace,
         model: resolved.cursorId,
         mode: "agent",
+        signal: abort.signal,
       });
       json(res, 200, responseObject(id, model, result.text));
     } catch (error) {
@@ -322,5 +400,10 @@ export function createBridgeServer(options: {
         },
       });
     }
+  }).on("close", () => {
+    clearInterval(cleanupTimer);
+    const sessions = new Set([...toolSessions.values()].map((entry) => entry.session));
+    toolSessions.clear();
+    for (const session of sessions) void session.close();
   });
 }

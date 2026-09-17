@@ -67,7 +67,12 @@ export class ToolBridge {
       const authorized = actual.length === expected.length && timingSafeEqual(actual, expected);
       if (!local) res.writeHead(403).end();
       else if (url.pathname !== this.#path || !authorized) res.writeHead(404).end();
-      else void this.#transport.handleRequest(req, res);
+      else void this.#transport.handleRequest(req, res).catch((error: unknown) => {
+        if (!res.headersSent) res.writeHead(500).end();
+        else res.end();
+        for (const listener of this.#listeners) listener();
+        void error;
+      });
     });
   }
 
@@ -79,8 +84,12 @@ export class ToolBridge {
       this.#transport as unknown as Parameters<Server["connect"]>[0],
     );
     await new Promise<void>((resolve, reject) => {
-      this.#http.once("error", reject);
-      this.#http.listen(0, "127.0.0.1", resolve);
+      const onError = (error: Error) => reject(error);
+      this.#http.once("error", onError);
+      this.#http.listen(0, "127.0.0.1", () => {
+        this.#http.off("error", onError);
+        resolve();
+      });
     });
     const address = this.#http.address();
     if (!address || typeof address === "string") throw new Error("MCP bridge bind failed");

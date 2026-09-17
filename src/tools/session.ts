@@ -45,15 +45,18 @@ export class ToolSession {
 
   async collect(): Promise<ToolTurn> {
     if (!this.#prompt) throw new Error("Tool session not started");
-    const toolReady = new Promise<"tools">((resolve) => {
-      const stop = this.bridge.onCall(() => {
-        setTimeout(() => { stop(); resolve("tools"); }, 40);
-      });
-    });
-    const winner = await Promise.race([
-      this.#prompt.then(() => "done" as const),
-      toolReady,
-    ]);
+    let stop: () => void = () => undefined;
+    let settleDelay: ReturnType<typeof setTimeout> | undefined;
+    const toolReady = this.bridge.pending().length > 0
+      ? Promise.resolve("tools" as const)
+      : new Promise<"tools">((resolve) => {
+          stop = this.bridge.onCall(() => {
+            settleDelay ??= setTimeout(() => resolve("tools"), 40);
+          });
+        });
+    const winner = await Promise.race([this.#prompt.then(() => "done" as const), toolReady]);
+    stop();
+    if (winner === "done" && settleDelay) clearTimeout(settleDelay);
     const text = this.#text;
     this.#text = "";
     if (winner === "tools") return { status: "tool_calls", text, calls: this.bridge.pending() };
