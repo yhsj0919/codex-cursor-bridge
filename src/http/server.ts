@@ -4,11 +4,17 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AcpPool } from "../acp/pool.js";
 import type { BridgeConfig } from "../config.js";
 import type { CursorModel } from "../cursor/models.js";
+import {
+  buildModelCatalog,
+  resolveCatalogModel,
+  UnsupportedReasoningEffortError,
+} from "../cursor/model-catalog.js";
 
 type ResponsesBody = {
   model?: string;
   input?: unknown;
   stream?: boolean;
+  reasoning?: { effort?: string };
 };
 
 function json(res: ServerResponse, status: number, value: unknown): void {
@@ -91,6 +97,7 @@ export function createBridgeServer(options: {
   models: CursorModel[];
 }) {
   const { config, pool, models } = options;
+  const catalog = buildModelCatalog(models);
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -101,7 +108,7 @@ export function createBridgeServer(options: {
       if (req.method === "GET" && url.pathname === "/v1/models") {
         json(res, 200, {
           object: "list",
-          data: models.map((model) => ({
+          data: catalog.map((model) => ({
             id: model.id,
             object: "model",
             owned_by: "cursor",
@@ -123,7 +130,20 @@ export function createBridgeServer(options: {
         });
         return;
       }
-      const model = body.model?.trim() || "auto";
+      let resolved;
+      try {
+        resolved = resolveCatalogModel(catalog, body.model, body.reasoning?.effort);
+      } catch (error) {
+        const unsupported = error instanceof UnsupportedReasoningEffortError;
+        json(res, unsupported ? 400 : 404, {
+          error: {
+            message: error instanceof Error ? error.message : String(error),
+            code: unsupported ? error.code : "model_not_found",
+          },
+        });
+        return;
+      }
+      const model = resolved.catalogId;
       const id = `resp_${randomUUID().replaceAll("-", "")}`;
 
       if (body.stream) {
@@ -138,7 +158,7 @@ export function createBridgeServer(options: {
         });
         const result = await pool.runSession({
           prompt,
-          model,
+          model: resolved.cursorId,
           mode: "agent",
           onText: (text) =>
             sse(res, "response.output_text.delta", {
@@ -153,7 +173,11 @@ export function createBridgeServer(options: {
         return;
       }
 
-      const result = await pool.runSession({ prompt, model, mode: "agent" });
+      const result = await pool.runSession({
+        prompt,
+        model: resolved.cursorId,
+        mode: "agent",
+      });
       json(res, 200, responseObject(id, model, result.text));
     } catch (error) {
       if (res.headersSent) {
