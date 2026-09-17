@@ -63,7 +63,12 @@ function inputText(input: unknown): string {
   return parts.join("\n\n");
 }
 
-function responseObject(id: string, model: string, text: string) {
+function responseObject(
+  id: string,
+  model: string,
+  text: string,
+  messageId = `msg_${randomUUID().replaceAll("-", "")}`,
+) {
   return {
     id,
     object: "response",
@@ -73,7 +78,7 @@ function responseObject(id: string, model: string, text: string) {
     model,
     output: [
       {
-        id: `msg_${randomUUID().replaceAll("-", "")}`,
+        id: messageId,
         type: "message",
         status: "completed",
         role: "assistant",
@@ -156,6 +161,30 @@ export function createBridgeServer(options: {
           type: "response.created",
           response: { id, object: "response", status: "in_progress", model, output: [] },
         });
+        const messageId = `msg_${randomUUID().replaceAll("-", "")}`;
+        const baseEvent = {
+          response_id: id,
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+        };
+        sse(res, "response.output_item.added", {
+          type: "response.output_item.added",
+          response_id: id,
+          output_index: 0,
+          item: {
+            id: messageId,
+            type: "message",
+            status: "in_progress",
+            role: "assistant",
+            content: [],
+          },
+        });
+        sse(res, "response.content_part.added", {
+          type: "response.content_part.added",
+          ...baseEvent,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
         const result = await pool.runSession({
           prompt,
           model: resolved.cursorId,
@@ -163,11 +192,35 @@ export function createBridgeServer(options: {
           onText: (text) =>
             sse(res, "response.output_text.delta", {
               type: "response.output_text.delta",
-              response_id: id,
+              ...baseEvent,
               delta: text,
             }),
         });
-        const response = responseObject(id, model, result.text);
+        sse(res, "response.output_text.done", {
+          type: "response.output_text.done",
+          ...baseEvent,
+          text: result.text,
+        });
+        sse(res, "response.content_part.done", {
+          type: "response.content_part.done",
+          ...baseEvent,
+          part: { type: "output_text", text: result.text, annotations: [] },
+        });
+        sse(res, "response.output_item.done", {
+          type: "response.output_item.done",
+          response_id: id,
+          output_index: 0,
+          item: {
+            id: messageId,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              { type: "output_text", text: result.text, annotations: [] },
+            ],
+          },
+        });
+        const response = responseObject(id, model, result.text, messageId);
         sse(res, "response.completed", { type: "response.completed", response });
         res.end("data: [DONE]\n\n");
         return;
