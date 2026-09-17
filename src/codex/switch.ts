@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { buildModelCatalog } from "../cursor/model-catalog.js";
 import { findCursorAgent } from "../cursor/discovery.js";
 import { listCursorModels } from "../cursor/models.js";
+import { defaultEffort, isCursorConfig, setCursorProvider, setTop } from "./config.js";
 
 const provider = process.argv[2];
 if (provider !== "cursor" && provider !== "codex") {
@@ -17,27 +18,6 @@ const catalogPath = join(codexDir, "cursor-models.json");
 const templatePath = join(codexDir, "models_cache.json");
 const officialPath = join(codexDir, "config.official.toml");
 let config = await readFile(configPath, "utf8");
-
-function splitTop(text: string): [string, string] {
-  const match = /^\s*\[/m.exec(text);
-  const index = match?.index ?? text.length;
-  return [text.slice(0, index), text.slice(index)];
-}
-function setTop(text: string, key: string, value?: string): string {
-  let [top, rest] = splitTop(text);
-  const pattern = new RegExp(`^\\s*${key}\\s*=.*(?:\\r?\\n|$)`, "m");
-  top = top.replace(pattern, "");
-  if (value !== undefined) top = `${key} = ${JSON.stringify(value)}\r\n${top.trimStart()}`;
-  return top + rest;
-}
-function providerBlock(text: string): string {
-  const block = `[model_providers.cursor]\r\nname = "Cursor Bridge"\r\nbase_url = "http://127.0.0.1:8765/v1"\r\nwire_api = "responses"\r\nrequires_openai_auth = false\r\n`;
-  const pattern = /^\[model_providers\.cursor\]\s*[\s\S]*?(?=^\[|\s*$)/m;
-  return pattern.test(text) ? text.replace(pattern, block) : `${text.trimEnd()}\r\n\r\n${block}`;
-}
-function defaultEffort(efforts: string[]): string {
-  return ["medium", "high", "low", "xhigh", "max", "none", "minimal"].find((item) => efforts.includes(item)) ?? "low";
-}
 
 if (provider === "cursor") {
   const agent = await findCursorAgent();
@@ -62,14 +42,14 @@ if (provider === "cursor") {
   const temporary = `${catalogPath}.tmp`;
   await writeFile(temporary, JSON.stringify(cache, null, 2), "utf8");
   await rename(temporary, catalogPath);
-  if (!/^\s*model_provider\s*=\s*["']cursor["']/m.test(splitTop(config)[0])) {
+  if (!isCursorConfig(config)) {
     await writeFile(officialPath, config, "utf8");
   }
   config = setTop(config, "model_reasoning_effort");
   config = setTop(config, "model_catalog_json", catalogPath.replaceAll("\\", "/"));
   config = setTop(config, "model", "auto");
   config = setTop(config, "model_provider", "cursor");
-  config = providerBlock(config);
+  config = setCursorProvider(config);
 } else {
   try {
     config = await readFile(officialPath, "utf8");
