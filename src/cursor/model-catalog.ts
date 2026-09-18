@@ -35,6 +35,23 @@ function variant(model: CursorModel): {
   effort?: ReasoningEffort;
   rawId: string;
 } {
+  const parameterized = model.id.match(/^([^[]+)\[(.*)\]$/);
+  if (parameterized) {
+    const parameters = new Map(
+      parameterized[2]!.split(",").filter(Boolean).map((entry) => {
+        const [key, ...value] = entry.split("=");
+        return [key!.trim().toLowerCase(), value.join("=").trim().toLowerCase()];
+      }),
+    );
+    const rawEffort = parameters.get("reasoning") ?? parameters.get("reasoning_effort") ?? parameters.get("effort");
+    const effort = rawEffort === "extra-high" ? "xhigh" : rawEffort as ReasoningEffort | undefined;
+    const fast = parameters.get("fast") === "true";
+    return {
+      baseId: `${parameterized[1]}${fast ? "-fast" : ""}`,
+      ...(effort && EFFORT_ORDER.includes(effort) ? { effort } : {}),
+      rawId: model.id,
+    };
+  }
   let core = model.id;
   let fast = false;
   if (core.toLowerCase().endsWith("-fast")) {

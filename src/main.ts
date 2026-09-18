@@ -1,14 +1,22 @@
 import { AcpConnection } from "./acp/connection.js";
 import { AcpPool } from "./acp/pool.js";
 import { loadConfig } from "./config.js";
+import { getCursorAccountInfo, type CursorAccountInfo } from "./cursor/account.js";
 import { findCursorAgent } from "./cursor/discovery.js";
-import { listCursorModels } from "./cursor/models.js";
+import { listAcpModels } from "./cursor/models.js";
 import { createBridgeServer } from "./http/server.js";
 import { ToolSession } from "./tools/session.js";
 
 const config = loadConfig();
 const agent = await findCursorAgent();
-const models = await listCursorModels(agent);
+const models = await listAcpModels(agent, config.workspace);
+let accountCache: { value: CursorAccountInfo; expiresAt: number } | undefined;
+const getCursorAccount = async (): Promise<CursorAccountInfo> => {
+  if (accountCache && accountCache.expiresAt > Date.now()) return accountCache.value;
+  const value = await getCursorAccountInfo(agent);
+  accountCache = { value, expiresAt: Date.now() + 60_000 };
+  return value;
+};
 const pool = new AcpPool({
   maxConnections: config.poolSize,
   createConnection: () =>
@@ -24,6 +32,7 @@ const server = createBridgeServer({
   config,
   pool,
   models,
+  getCursorAccount,
   createToolSession: (tools) =>
     new ToolSession(
       {

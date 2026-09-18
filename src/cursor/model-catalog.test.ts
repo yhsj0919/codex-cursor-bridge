@@ -52,4 +52,27 @@ describe("model catalog", () => {
       "composer-2.5",
     );
   });
+
+  it("maps parameterized ACP model ids without inventing unsupported variants", () => {
+    const acpCatalog = buildModelCatalog([
+      { id: "auto", name: "Auto" },
+      {
+        id: "gpt-5.6-sol[context=272k,reasoning=medium,fast=false]",
+        name: "gpt-5.6-sol",
+      },
+      {
+        id: "gpt-5.6-sol[context=272k,reasoning=high,fast=true]",
+        name: "gpt-5.6-sol",
+      },
+    ]);
+    expect(resolveCatalogModel(acpCatalog, "gpt-5.6-sol", "medium").cursorId).toBe(
+      "gpt-5.6-sol[context=272k,reasoning=medium,fast=false]",
+    );
+    expect(resolveCatalogModel(acpCatalog, "gpt-5.6-sol-fast", "high").cursorId).toBe(
+      "gpt-5.6-sol[context=272k,reasoning=high,fast=true]",
+    );
+    expect(() => resolveCatalogModel(acpCatalog, "gpt-5.6-sol", "high")).toThrow(
+      UnsupportedReasoningEffortError,
+    );
+  });
 });

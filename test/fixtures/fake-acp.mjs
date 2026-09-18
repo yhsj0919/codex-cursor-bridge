@@ -56,7 +56,7 @@ input.on("line", (line) => {
         },
       },
     });
-    if (promptText === "permission") {
+    if (promptText === "permission" || promptText.includes("User request:\nnative-delete")) {
       pendingPermissionPrompt = message;
       send({
         jsonrpc: "2.0",
@@ -64,7 +64,9 @@ input.on("line", (line) => {
         method: "session/request_permission",
         params: {
           sessionId,
-          toolCall: { title: "shell" },
+          toolCall: promptText === "permission"
+            ? { title: "shell" }
+            : { title: "Delete", rawInput: { path: "current-model.txt" } },
           options: [
             { optionId: "allow-once", kind: "allow_once" },
             { optionId: "reject-once", kind: "reject_once" },

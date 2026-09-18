@@ -55,7 +55,7 @@ export class ToolBridge {
           callId, itemId, name: definition.name, arguments: argumentsText,
           responseType: definition.responseType, resolve, reject,
         });
-        for (const listener of this.#listeners) listener();
+        this.#emit();
       });
     });
     this.#http = createServer((req, res) => {
@@ -102,6 +102,31 @@ export class ToolBridge {
       headers: [{ name: "Authorization", value: `Bearer ${this.#token}` }] };
   }
   get listed(): boolean { return this.#listed; }
+  get instructions(): string {
+    const names = this.#definitions.map((tool) => tool.name).join(", ");
+    const hasRequestPermissions = this.#definitions.some(
+      (tool) => tool.name.toLowerCase() === "request_permissions",
+    );
+    const lines = [
+      `Tool policy for MCP server ${this.name}:`,
+      `Available Codex tools: ${names || "none"}.`,
+      "For every file, terminal, shell, browser, network, or other side-effecting operation, you MUST use an available tool from this MCP server.",
+      "Never use Cursor built-in file, shell, terminal, edit, browser, or system tools.",
+      "Prefer MCP tools so Codex can execute them directly after approval.",
+      "Native Cursor tool permission requests are intentionally blocked and are never forwarded as approvals.",
+      "If you receive native_tool_blocked, immediately retry the requested operation with the equivalent tool from this MCP server.",
+      "If no suitable MCP tool is available, explain that the required Codex tool is unavailable instead of attempting a built-in operation.",
+    ];
+    if (hasRequestPermissions) {
+      lines.push(
+        "Codex approval workflow:",
+        "If a file, delete, edit, or terminal tool reports permission denied, sandbox denied, approval required, or a similar permission error, you MUST call request_permissions with the needed filesystem or network permissions and a concrete reason.",
+        "Wait for request_permissions to complete, then retry the original Codex tool once when permission is granted.",
+        "Do not only tell the user to click Allow: an actual request_permissions tool call must be pending for Codex to show the approval dialog.",
+      );
+    }
+    return lines.join("\n");
+  }
   pending(): PendingToolCall[] {
     return [...this.#pending.values()].map(({ resolve: _r, reject: _j, ...call }) => call);
   }
@@ -126,5 +151,9 @@ export class ToolBridge {
     await this.#mcp.close().catch(() => undefined);
     this.#http.closeAllConnections?.();
     if (this.#http.listening) await new Promise<void>((resolve) => this.#http.close(() => resolve()));
+  }
+
+  #emit(): void {
+    for (const listener of this.#listeners) listener();
   }
 }

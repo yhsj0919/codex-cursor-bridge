@@ -24,6 +24,10 @@ describe("ToolBridge", () => {
     ]);
     bridges.push(bridge);
     await bridge.start();
+    expect(bridge.instructions).toContain("read_file");
+    expect(bridge.instructions).toContain("Never use Cursor built-in");
+    expect(bridge.instructions).toContain("Native Cursor tool permission requests are intentionally blocked");
+    expect(bridge.instructions).toContain("native_tool_blocked");
 
     const client = new Client({ name: "test", version: "1.0.0" });
     clients.push(client);
@@ -46,5 +50,19 @@ describe("ToolBridge", () => {
     bridge.resolve([{ callId: pending[0]!.callId, output: "contents" }]);
     const result = await resultPromise;
     expect(result.content).toEqual([{ type: "text", text: "contents" }]);
+  });
+
+  it("explains the request_permissions approval flow when Codex exposes it", () => {
+    const bridge = new ToolBridge([
+      {
+        name: "request_permissions",
+        description: "Request additional permissions from the user",
+        inputSchema: { type: "object" },
+        responseType: "function",
+      },
+    ]);
+    bridges.push(bridge);
+    expect(bridge.instructions).toContain("MUST call request_permissions");
+    expect(bridge.instructions).toContain("actual request_permissions tool call");
   });
 });

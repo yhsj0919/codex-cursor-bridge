@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 
+import { AcpConnection } from "../acp/connection.js";
 import type { CursorAgentCommand } from "./discovery.js";
 
 export type CursorModel = { id: string; name: string };
@@ -31,6 +32,30 @@ export async function listCursorModels(
     throw new Error("Cursor Agent returned an empty model catalog");
   }
   return models;
+}
+
+export async function listAcpModels(
+  agent: CursorAgentCommand,
+  workspace: string,
+): Promise<CursorModel[]> {
+  const connection = new AcpConnection({
+    command: agent.command,
+    args: [...agent.prefixArgs, "--workspace", workspace, "acp"],
+    cwd: workspace,
+    env: agent.env,
+    skipAuthenticate: true,
+  });
+  try {
+    const session = await connection.createSession(workspace);
+    const models = session.models?.availableModels ?? [];
+    if (models.length === 0) throw new Error("Cursor ACP returned an empty model catalog");
+    return models.map((model) => ({
+      id: model.modelId === "default[]" ? "auto" : model.modelId,
+      name: model.modelId === "default[]" ? "Auto" : model.name,
+    }));
+  } finally {
+    await connection.close();
+  }
 }
 
 function run(

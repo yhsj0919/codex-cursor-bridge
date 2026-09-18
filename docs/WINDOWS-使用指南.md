@@ -42,10 +42,42 @@ npm run build
 
 ## 三、启动 Bridge
 
-最简单的方式是双击：
+双击以下入口会打开常驻的 Bridge 管理工具：
 
 ```text
 启动代理.bat
+```
+
+管理工具提供：
+
+```text
+[1] 启动 Bridge（后台运行）
+[2] 停止 Bridge
+[3] 查看运行状态
+[4] 重启 Bridge
+[5] 环境/安装检测
+[6] 查看可用模型
+[7] 测试 API
+[8] 查看最近日志
+[9] 安装或更新 Bridge
+[10] 模型来源管理
+[0] 退出
+```
+
+Bridge 会在隐藏的后台进程中运行，管理菜单不会因启动或停止操作而退出。日志和进程记录保存在项目的 `.bridge-runtime` 目录中；停止操作会校验进程身份，不会终止其他 Node.js 程序。
+
+“环境/安装检测”会统一检查 Windows、PowerShell、Node.js/npm 的版本和路径、Cursor Agent 版本与登录状态、Cursor 原始模型数量、项目依赖、构建产物、端口监听进程、Bridge API、规范化模型数量和当前 Codex 模型来源。“安装或更新 Bridge”会依次运行 `npm install`、完整检查和构建。
+
+如果希望像旧版一样在当前窗口直接启动并查看实时日志，双击：
+
+```text
+控制台启动代理.bat
+```
+
+该入口会自动检查 Node.js、安装依赖（如果尚未安装）、构建 TypeScript、检查 Cursor 登录，然后以前台模式运行 Bridge。按 `Ctrl+C` 停止。它同样支持传入工作区根目录：
+
+```powershell
+.\控制台启动代理.bat E:\my-projects
 ```
 
 默认允许的工作区根目录是 Bridge 自己的目录。若要让 Cursor 处理另一个项目，请把项目根目录作为参数传入：
@@ -75,22 +107,29 @@ $env:CURSOR_BRIDGE_POOL_SIZE = '2'
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/healthz
 Invoke-RestMethod http://127.0.0.1:8765/v1/models
+Invoke-RestMethod http://127.0.0.1:8765/v1/cursor/account
 ```
+
+`/v1/cursor/account` 返回经过白名单筛选的 Cursor 登录用户、订阅等级、CLI 版本和默认模型，不返回 access token、refresh token 或本机路径。Cursor Agent 当前没有提供用量总数、剩余额度或重置时间，因此 `usage.available` 会明确为 `false`。
 
 ## 四、切换模型来源
 
-切换前必须从系统托盘完全退出 Codex。然后双击：
+双击以下入口会打开一个常驻的模型来源管理菜单：
 
 ```text
 切换模型来源.bat
 ```
 
-选择：
+菜单会显示当前状态，并可以反复执行：
 
 ```text
-1. Codex 官方模型
-2. Cursor 模型
+1. 切换到 Codex 官方模型
+2. 切换到 Cursor 模型
+3. 查看/刷新当前状态
+0. 退出
 ```
+
+查看状态时不需要关闭 Codex。只有选择切换时，如果 Codex 仍在运行，菜单才会提示从系统托盘完全退出 Codex，并在当前窗口等待重试。切换完成后会自动返回菜单，不需要重新打开脚本。
 
 选择 Cursor 时，脚本会：
 
@@ -99,6 +138,12 @@ Invoke-RestMethod http://127.0.0.1:8765/v1/models
 3. 把不同思考档位合并到同一个 Codex 模型项，Fast 版保留为单独模型。
 4. 原子写入 `%USERPROFILE%\.codex\cursor-models.json`。
 5. 备份并更新 `%USERPROFILE%\.codex\config.toml`。
+
+为了让 Cursor 模型发起的写文件、删除和终端命令能进入 Codex 自带的授权弹窗，Cursor 模式会同时设置 `sandbox_mode = "read-only"` 和 `approval_policy = "on-request"`。切回官方模型时，会恢复首次切换前的完整官方配置。
+
+如果 Cursor 仍尝试原生 Delete/Shell/Edit，Bridge 会拒绝该原生权限请求，并在响应中加入 `native_tool_blocked`、工具名和可用的请求参数。Cursor 随后应改用 Bridge MCP 中的等价 Codex 工具。Bridge 不会用“无副作用审批探针”冒充真实操作的授权，因为探针授权不能安全地转授给 Cursor 进程。
+
+只有真实的 Codex 工具调用才会进入 Codex 自带的授权流程。若当前请求暴露了 `request_permissions`，Cursor 会先通过 Bridge MCP 调用它，请求文件系统或网络权限；用户批准后，再通过 Bridge MCP 重试原操作。这样授权对象与实际执行对象始终都是 Codex。
 
 选择官方模型时，脚本会恢复首次切到 Cursor 前保存的完整官方配置。每次切换还会额外生成带时间戳的 `.bak` 文件。
 

@@ -5,6 +5,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 
 import type { AcpPool } from "../acp/pool.js";
 import type { BridgeConfig } from "../config.js";
+import type { CursorAccountInfo } from "../cursor/account.js";
 import type { CursorModel } from "../cursor/models.js";
 import type { ToolSession, ToolTurn } from "../tools/session.js";
 import type { ToolDefinition, ToolOutput } from "../tools/types.js";
@@ -29,7 +30,13 @@ type SessionRunner = {
 
 type ToolSessionLike = Pick<ToolSession, "start" | "collect" | "resume" | "has" | "close">;
 
-type StoredToolSession = { session: ToolSessionLike; owner: string; expiresAt: number };
+type StoredToolSession = { session: ToolSessionLike; expiresAt: number };
+
+type ToolDiagnostics = {
+  receivedAt: string;
+  raw: Array<{ type: string; name?: string }>;
+  bridged: Array<{ type: string; name: string }>;
+};
 
 function json(res: ServerResponse, status: number, value: unknown): void {
   const body = JSON.stringify(value);
@@ -77,6 +84,29 @@ function inputText(input: unknown): string {
   return parts.join("\n\n");
 }
 
+function userTextAfterLastToolOutput(input: unknown): string {
+  if (!Array.isArray(input)) return "";
+  let lastOutputIndex = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!item || typeof item !== "object") continue;
+    const type = (item as { type?: unknown }).type;
+    if (type === "function_call_output" || type === "custom_tool_call_output") lastOutputIndex = index;
+  }
+  return input.slice(lastOutputIndex + 1).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as { role?: unknown; content?: unknown };
+    if (record.role !== "user") return [];
+    if (typeof record.content === "string") return [record.content];
+    if (!Array.isArray(record.content)) return [];
+    return [record.content.map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const text = (part as { text?: unknown }).text;
+      return typeof text === "string" ? text : "";
+    }).join("")];
+  }).filter(Boolean).join("\n\n");
+}
+
 function responseObject(
   id: string,
   model: string,
@@ -110,10 +140,6 @@ function sse(res: ServerResponse, event: string, data: unknown): void {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function requestOwner(req: IncomingMessage): string {
-  return `${req.socket.remoteAddress ?? "local"}|${req.headers.authorization ?? ""}|${req.headers["x-codex-session-id"] ?? ""}`;
-}
-
 function requestWorkspace(req: IncomingMessage, root: string): string {
   const header = req.headers["x-cursor-workspace"];
   if (!header) return realpathSync(root);
@@ -135,12 +161,14 @@ export function createBridgeServer(options: {
   createToolSession?: (tools: ToolDefinition[]) => ToolSessionLike;
   toolSessionTtlMs?: number;
   maxToolSessions?: number;
+  getCursorAccount?: () => Promise<CursorAccountInfo>;
 }) {
   const { config, pool, models } = options;
   const catalog = buildModelCatalog(models);
   const toolSessions = new Map<string, StoredToolSession>();
   const toolSessionTtlMs = options.toolSessionTtlMs ?? 10 * 60_000;
   const maxToolSessions = options.maxToolSessions ?? 128;
+  let lastToolDiagnostics: ToolDiagnostics | null = null;
   const cleanup = (): void => {
     const now = Date.now();
     const expired = new Set<ToolSessionLike>();
@@ -190,7 +218,7 @@ export function createBridgeServer(options: {
     try {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
       if (req.method === "GET" && url.pathname === "/healthz") {
-        json(res, 200, { status: "ok", pool: pool.stats });
+        json(res, 200, { status: "ok", pool: pool.stats, lastToolDiagnostics });
         return;
       }
       if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -203,6 +231,14 @@ export function createBridgeServer(options: {
             name: model.name,
           })),
         });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/v1/cursor/account") {
+        if (!options.getCursorAccount) {
+          json(res, 501, { error: { message: "Cursor account information is unavailable", code: "not_configured" } });
+          return;
+        }
+        json(res, 200, await options.getCursorAccount());
         return;
       }
       if (req.method !== "POST" || url.pathname !== "/v1/responses") {
@@ -239,6 +275,19 @@ export function createBridgeServer(options: {
       const model = resolved.catalogId;
       const id = `resp_${randomUUID().replaceAll("-", "")}`;
       const definitions = parseTools(body.tools);
+      lastToolDiagnostics = {
+        receivedAt: new Date().toISOString(),
+        raw: (body.tools ?? []).flatMap((item) => {
+          if (!item || typeof item !== "object") return [];
+          const tool = item as Record<string, unknown>;
+          return [{
+            type: typeof tool.type === "string" ? tool.type : "unknown",
+            ...(typeof tool.name === "string" ? { name: tool.name } : {}),
+          }];
+        }),
+        bridged: definitions.map((tool) => ({ type: tool.responseType, name: tool.name })),
+      };
+      console.log(`[tools] ${JSON.stringify(lastToolDiagnostics)}`);
       let workspace: string;
       try {
         workspace = requestWorkspace(req, config.workspace);
@@ -253,15 +302,38 @@ export function createBridgeServer(options: {
         let turn: ToolTurn;
         if (submittedOutputs.length > 0) {
           cleanup();
-          const stored = toolSessions.get(submittedOutputs[0]!.callId);
-          const owner = requestOwner(req);
-          session = stored?.session!;
-          if (!stored || stored.owner !== owner || !submittedOutputs.every((output) => session.has(output.callId))) {
-            json(res, 409, { error: { message: "Tool session is missing or expired", code: "tool_session_expired" } });
-            return;
+          const currentOutputs = submittedOutputs.filter((output) => {
+            const candidate = toolSessions.get(output.callId);
+            return candidate?.session.has(output.callId);
+          });
+          const stored = currentOutputs.length > 0
+            ? toolSessions.get(currentOutputs[0]!.callId)
+            : undefined;
+          if (stored) {
+            session = stored.session;
+            if (!currentOutputs.every((output) => toolSessions.get(output.callId)?.session === session)) {
+              json(res, 409, { error: { message: "Tool session is missing or expired", code: "tool_session_expired" } });
+              return;
+            }
+            for (const output of currentOutputs) toolSessions.delete(output.callId);
+            turn = await session.resume(currentOutputs);
+          } else {
+            // Codex sends prior tool outputs again as conversation history. If
+            // a new user message follows them, this is a new turn rather than
+            // a continuation of the expired call.
+            const freshPrompt = userTextAfterLastToolOutput(body.input);
+            if (!freshPrompt || definitions.length === 0) {
+              json(res, 409, { error: { message: "Tool session is missing or expired", code: "tool_session_expired" } });
+              return;
+            }
+            if (new Set([...toolSessions.values()].map((entry) => entry.session)).size >= maxToolSessions) {
+              json(res, 503, { error: { message: "Too many pending tool sessions", code: "tool_session_limit" } });
+              return;
+            }
+            session = options.createToolSession(definitions);
+            await session.start(freshPrompt, workspace, resolved.cursorId);
+            turn = await session.collect();
           }
-          for (const output of submittedOutputs) toolSessions.delete(output.callId);
-          turn = await session.resume(submittedOutputs);
         } else {
           cleanup();
           if (new Set([...toolSessions.values()].map((entry) => entry.session)).size >= maxToolSessions) {
@@ -273,7 +345,11 @@ export function createBridgeServer(options: {
           turn = await session.collect();
         }
         if (turn.status === "tool_calls") {
-          const stored = { session, owner: requestOwner(req), expiresAt: Date.now() + toolSessionTtlMs };
+          // A Responses continuation may arrive with a different
+          // x-codex-session-id after an approval UI round trip. The random
+          // call_id is the stable continuation key; binding it to transient
+          // request headers makes valid tool results look expired.
+          const stored = { session, expiresAt: Date.now() + toolSessionTtlMs };
           for (const call of turn.calls) toolSessions.set(call.callId, stored);
         }
         const response = toolResponse(id, model, turn);

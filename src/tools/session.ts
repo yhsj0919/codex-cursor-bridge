@@ -13,6 +13,7 @@ export class ToolSession {
   #sessionId?: string;
   #prompt?: Promise<unknown>;
   #text = "";
+  #nativePermissionBlocks: string[] = [];
   #closed = false;
 
   constructor(options: AcpConnectionOptions, tools: ToolDefinition[]) {
@@ -22,9 +23,22 @@ export class ToolSession {
       onText: (text) => (this.#text += text),
       onPermission: (request) => {
         const payload = JSON.stringify(request).toLowerCase();
-        return this.bridge.listed && payload.includes(this.bridge.name.toLowerCase())
-          ? "allow-once"
-          : "reject-once";
+        if (this.bridge.listed && payload.includes(this.bridge.name.toLowerCase())) {
+          return "allow-once";
+        }
+        const toolCall = request.toolCall;
+        const tool = toolCall && typeof toolCall === "object"
+          ? toolCall as Record<string, unknown>
+          : {};
+        const title = typeof tool.title === "string" ? tool.title : "unknown Cursor tool";
+        const details = tool.rawInput && typeof tool.rawInput === "object"
+          ? `; request=${JSON.stringify(tool.rawInput)}`
+          : "";
+        this.#nativePermissionBlocks.push(
+          `[native_tool_blocked] Cursor native tool "${title}" was blocked${details}. ` +
+          "The operation was not approved or executed. Retry it with an equivalent Codex tool from the Bridge MCP server.",
+        );
+        return "reject-once";
       },
     });
   }
@@ -40,7 +54,8 @@ export class ToolSession {
     if (model.toLowerCase() !== "auto") {
       await this.#connection.setSessionOption(this.#sessionId, "model", model);
     }
-    this.#prompt = this.#connection.promptSession(this.#sessionId, prompt);
+    const guardedPrompt = `${this.bridge.instructions}\n\nUser request:\n${prompt}`;
+    this.#prompt = this.#connection.promptSession(this.#sessionId, guardedPrompt);
   }
 
   async collect(): Promise<ToolTurn> {
@@ -57,7 +72,8 @@ export class ToolSession {
     const winner = await Promise.race([this.#prompt.then(() => "done" as const), toolReady]);
     stop();
     if (winner === "done" && settleDelay) clearTimeout(settleDelay);
-    const text = this.#text;
+    const notices = this.#nativePermissionBlocks.splice(0).join("\n");
+    const text = [this.#text, notices].filter(Boolean).join("\n");
     this.#text = "";
     if (winner === "tools") return { status: "tool_calls", text, calls: this.bridge.pending() };
     await this.close();
